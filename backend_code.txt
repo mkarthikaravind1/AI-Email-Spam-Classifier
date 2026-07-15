@@ -1,0 +1,288 @@
+
+===== FILE: D:\Data\AI\Text_Classifier_Project\Backend\classifiers\llm_classifier.py =====
+
+import pandas as pd
+from transformers import pipeline
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score
+
+# Load your dataset
+df = pd.read_csv("data/cleaned_spam.csv")
+df = df.rename(columns={"v1": "label", "v2": "text"}).dropna(subset=["text"])
+
+# Grab 20 rows for a quick test
+df_sample = df.head(20).copy()
+
+# Initialize the Pipeline
+print("Loading the model from Hugging Face...")
+classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+# Labels for classification
+candidate_labels = ["spam", "ham"]
+# Stores predictions for each message
+predictions = []
+
+# Predicts spam/ham label and confidence score for a given text
+def predict_llm(text):
+    result = classifier(
+        text,
+        candidate_labels=["spam", "ham"]
+    )
+    prediction = result["labels"][0]
+    confidence = result["scores"][0] * 100
+
+    return {
+        "prediction": prediction,
+        "confidence": round(confidence, 2)
+    }
+
+# Runs classification on sample and prints accuracy
+if __name__ == "__main__":
+    print("Classifying messages with the LLM...")
+
+    for text in tqdm(df_sample["text"]):
+        result = classifier(text, candidate_labels=candidate_labels)
+        top_prediction = result["labels"][0]
+        predictions.append(top_prediction)
+    df_sample["prediction"] = predictions
+
+    print("\n--- LLM Classifier Results (Sample) ---")
+    print(df_sample[["text", "label", "prediction"]].head(10))
+
+    acc = accuracy_score(df_sample["label"], df_sample["prediction"])
+    print(f"\nSample Accuracy: {acc:.2%}")
+
+===== FILE: D:\Data\AI\Text_Classifier_Project\Backend\classifiers\regex_classifier.py =====
+
+import pandas as pd
+from collections import Counter
+import re
+from sklearn.metrics import classification_report
+
+df = pd.read_csv("data/cleaned_spam.csv")
+df = df.rename(columns={
+    "v1":"label",
+    "v2":"text"
+})
+
+# Rules for deciding spam
+SPAM_RULES = {
+    "free_offer": r"\bfree\b",
+    "win_prize": r"\b(win|winner|won|prize)\b",
+    "urgent_action": r"\b(act now|limited time|urgent)\b",
+    "money_offer": r"\b(cash|earn \$?\d+|guaranteed income)\b",
+    "suspicious_links": r"(http[s]?://|www\.)",
+    "claim_reward": r"\b(claim|reward|gift card)\b",
+}
+
+# Matches the text with the rules
+def get_matched_rules(text):
+    text = str(text).lower()
+    matches = []
+
+    for rule_name, pattern in SPAM_RULES.items():
+        if re.search(pattern, text):
+            matches.append(rule_name)
+
+    return matches
+
+# Weights assigned to each rule (higher = stronger spam signal)
+RULE_WEIGHTS = {
+    "free_offer": 1,
+    "win_prize": 2,
+    "urgent_action": 1,
+    "money_offer": 3,
+    "suspicious_links": 2,
+    "claim_reward": 2
+}
+
+# Calculates the score for the no of matches
+def spam_score(text):
+    matches = get_matched_rules(text)
+    return sum(RULE_WEIGHTS[r] for r in matches)
+
+# Classifies the text based on the score
+def classify_spam_weighted(text):
+    score = spam_score(text)
+    return "spam" if score >= 3 else "ham"
+
+# Returns full prediction details including score, confidence, and matched rules
+def predict_regex(text):
+    matches = get_matched_rules(text)
+    score = spam_score(text)
+    prediction = classify_spam_weighted(text)
+    confidence = min((score / 10) * 100, 100)
+
+    return {
+        "prediction": prediction,
+        "score": score,
+        "confidence": round(confidence, 2),
+        "matched_rules": matches
+    }
+
+# Runs classifier on full dataset, prints report and top 50 spam words
+if __name__ == "__main__":
+    df["score"] = df["text"].apply(spam_score)
+    df["prediction"] = df["text"].apply(classify_spam_weighted)
+
+    print(
+        classification_report(
+            df["label"],
+            df["prediction"]
+        )
+    )
+
+    spam_text = df[df["label"] == "spam"]["text"]
+    counter = Counter()
+
+    for msg in spam_text:
+        words = str(msg).lower().split()
+        counter.update(words)
+
+    print(counter.most_common(50))
+
+===== FILE: D:\Data\AI\Text_Classifier_Project\Backend\classifiers\statistical_ml_classifier.py =====
+
+import joblib
+
+# Loads the saved naive_bayes & tfidf 
+model = joblib.load(
+    "saved_models/naive_bayes.pkl"
+)
+tfidf = joblib.load(
+    "saved_models/tfidf.pkl"
+)
+
+# Predicts based on the trained ML model
+def predict_ml(custom_text):
+    transformed_text = tfidf.transform(
+        [custom_text]
+    )
+    prediction = model.predict(
+        transformed_text
+    )[0]
+    probabilities = model.predict_proba(
+        transformed_text
+    )[0]
+
+    confidence = max(probabilities) * 100
+
+    return {
+        "prediction": prediction,
+        "confidence": round(confidence, 2)
+    }
+
+# Tests the model with a ham and spam example
+if __name__ == "__main__":
+    print(predict_ml("Hey, are we still meeting for lunch at 1 PM?"))
+    print(predict_ml("URGENT! Click here to claim your free $500 cash prize now!"))
+
+===== FILE: D:\Data\AI\Text_Classifier_Project\Backend\classifiers\__init__.py =====
+
+
+===== FILE: D:\Data\AI\Text_Classifier_Project\Backend\app.py =====
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from classifiers.regex_classifier import predict_regex
+from classifiers.statistical_ml_classifier import predict_ml
+from classifiers.llm_classifier import predict_llm
+import time
+
+# Initialises FastAPI
+app = FastAPI(title="AI Email Spam Classifier")
+
+# Enables cross-origin requests (allows frontend on a different port/domain to call this API)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Request schema - expects a single email_text string
+class EmailRequest(BaseModel):
+    email_text: str
+
+# Health check endpoint
+@app.get("/")
+def home():
+    return {"message": "Backend running"}
+
+# Analyzes the email based on teh output of the 3 classifiers
+@app.post("/analyze")
+def analyze_email(request: EmailRequest):
+    start_time = time.time()
+
+    regex_result = predict_regex(request.email_text)
+    ml_result = predict_ml(request.email_text)
+    llm_result = predict_llm(request.email_text)
+
+    end_time = time.time()
+
+    votes = [
+        regex_result["prediction"],
+        ml_result["prediction"],
+        llm_result["prediction"]
+    ]
+
+    # Majority vote across 3 classifiers to determine final verdict
+    spam_votes = votes.count("spam")
+    ham_votes = votes.count("ham")
+
+    if spam_votes > ham_votes:
+        final_verdict = "spam"
+        agreement = f"{spam_votes}/3"
+    else:
+        final_verdict = "ham"
+        agreement = f"{ham_votes}/3"
+
+    return {
+        "regex": regex_result,
+        "ml": ml_result,
+        "llm": llm_result,
+        "final_verdict": final_verdict,
+        "agreement": agreement,
+        "processing_time": round(end_time - start_time, 2)
+    }
+
+===== FILE: D:\Data\AI\Text_Classifier_Project\Backend\train_model.py =====
+
+import joblib
+import pandas as pd
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import MultinomialNB
+
+df = pd.read_csv("data/cleaned_spam.csv")
+# Renames the columns in the cleaned_spam.csv
+df = df.rename(columns={"v1": "label","v2": "text"})
+
+# Drops null/empty value rows
+df = df.dropna(subset=["text"])
+
+ # Separate features and labels
+X = df["text"]
+y = df["label"]
+
+# Splits into 80% train, 20% test with stratification to preserve class balance
+X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2,random_state=42,stratify=y)
+
+# Converts text to lowercase and removes common English stop words (e.g. "the", "is")
+tfidf = TfidfVectorizer(stop_words="english",lowercase=True)
+
+# Fits TF-IDF on training data and transforms it into feature vectors
+X_train_tfidf = tfidf.fit_transform(X_train)
+
+# Trains a Multinomial Naive Bayes model on the TF-IDF features
+model = MultinomialNB()
+model.fit(X_train_tfidf,y_train)
+
+# Saves trained model and vectorizer to disk for later use
+joblib.dump(model,"saved_models/naive_bayes.pkl")
+joblib.dump(tfidf,"saved_models/tfidf.pkl")
+
+print("Model and vectorizer saved successfully!")

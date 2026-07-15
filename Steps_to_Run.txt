@@ -1,0 +1,5 @@
+cd Backend
+python -m uvicorn app:app --reload
+
+cd Frontend
+npm run dev
