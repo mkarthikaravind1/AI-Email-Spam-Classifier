@@ -1,0 +1,21 @@
+Return-Path: <priya.sharma@example.org>
+Authentication-Results: mx.example.com;
+ spf=pass smtp.mailfrom=example.org;
+ dkim=pass header.d=example.org;
+ dmarc=pass header.from=example.org
+From: "Priya Sharma" <priya.sharma@example.org>
+To: team@example.org
+Subject: Are we still meeting tomorrow?
+Date: Mon, 09 Nov 2026 09:30:00 +0530
+Message-ID: <sample-legit-001@example.org>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hi all,
+
+Are we still meeting tomorrow at 3pm to go through the project plan?
+I'll bring the notes from last week. Let me know if the time doesn't work
+and we can move it to Wednesday.
+
+Thanks,
+Priya

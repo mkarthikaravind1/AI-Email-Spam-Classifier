@@ -146,8 +146,10 @@ def analyze_url(raw):
                 break  # it is the real site
             # Not an official domain, yet the name is (or nearly is) the brand:
             # paypa1.com, amaz0n.com, paypal.xyz, Cyrillic pаypal.com
-            cleaned = _unlookalike(name)
-            if cleaned == brand or (len(brand) >= 5 and _levenshtein(name, brand) == 1):
+            # Also each hyphen part, so "paypa1-support.com" is caught
+            candidates = {name, *name.split("-")}
+            if any(_unlookalike(c) == brand or (len(brand) >= 5 and _levenshtein(c, brand) == 1)
+                   for c in candidates if c):
                 add("lookalike", f"'{reg}' imitates {brand} (real site: {sorted(official)[0]})")
                 break
             # Brand as a whole word elsewhere in the host: paypal.com.evil.top, dhl-delivery.xyz

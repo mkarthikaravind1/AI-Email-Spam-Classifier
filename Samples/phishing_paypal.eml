@@ -1,0 +1,51 @@
+Return-Path: <bounce@mailer-xq7.ru>
+Received-SPF: fail (example.com: domain of paypa1-support.com does not designate 185.22.10.4 as permitted sender)
+Authentication-Results: mx.example.com;
+ spf=fail smtp.mailfrom=paypa1-support.com;
+ dkim=none;
+ dmarc=fail header.from=paypa1-support.com
+From: "PayPal Security Team" <security@paypa1-support.com>
+Reply-To: account-verify@gmail.com
+To: customer@example.com
+Subject: Urgent: your account has been limited
+Date: Mon, 09 Nov 2026 08:14:02 +0000
+Message-ID: <sample-phish-001@paypa1-support.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="MIXED"
+
+--MIXED
+Content-Type: multipart/alternative; boundary="ALT"
+
+--ALT
+Content-Type: text/plain; charset="utf-8"
+
+Dear customer,
+
+We noticed unusual activity and your account has been limited. Verify your
+identity within 24 hours or your account will be permanently suspended.
+
+Verify now: https://www.paypal.com/signin
+
+PayPal Security Team
+
+--ALT
+Content-Type: text/html; charset="utf-8"
+
+<html><body>
+<p>Dear customer,</p>
+<p>We noticed unusual activity and your account has been <b>limited</b>. Verify your
+identity within 24 hours or your account will be permanently suspended.</p>
+<p>Verify now: <a href="http://paypa1-support.com/login/verify">https://www.paypal.com/signin</a></p>
+<p>PayPal Security Team</p>
+</body></html>
+
+--ALT--
+
+--MIXED
+Content-Type: application/octet-stream; name="Account_Statement.pdf.exe"
+Content-Disposition: attachment; filename="Account_Statement.pdf.exe"
+Content-Transfer-Encoding: base64
+
+VGhpcyBpcyBhIGhhcm1sZXNzIHBsYWNlaG9sZGVyLCBub3QgYSByZWFsIHByb2dyYW0uCg==
+
+--MIXED--

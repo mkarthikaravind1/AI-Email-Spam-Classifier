@@ -1,11 +1,13 @@
 import { useState } from "react";
 import AnalyzeTab from "./components/AnalyzeTab";
+import BatchTab from "./components/BatchTab";
 import BenchmarkTab from "./components/BenchmarkTab";
 import FeedbackTab from "./components/FeedbackTab";
 import PlaygroundTab from "./components/PlaygroundTab";
 
 const TABS = [
   { key: "analyze", label: "Analyze" },
+  { key: "batch", label: "Batch" },
   { key: "benchmark", label: "Benchmark" },
   { key: "playground", label: "Robustness" },
   { key: "feedback", label: "Feedback" },
@@ -36,6 +38,7 @@ function App() {
 
   const content = {
     analyze: <AnalyzeTab />,
+    batch: <BatchTab />,
     benchmark: <BenchmarkTab />,
     playground: <PlaygroundTab />,
     feedback: <FeedbackTab />,

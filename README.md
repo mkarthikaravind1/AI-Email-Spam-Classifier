@@ -1,6 +1,6 @@
 # AI Email Spam Classifier
 
-A full-stack spam detection app that classifies a message with four very different models: **regex rules**, **statistical ML** (character n-gram Logistic Regression), a **fine-tuned DistilBERT** transformer and a **zero-shot NLI** transformer (BART). A **learned stacking ensemble** combines them into one verdict. On top of that it explains every decision word by word, checks links for phishing, resists obfuscation tricks, runs a speed-saving cascade, ships a full benchmark dashboard and learns from your feedback.
+A full-stack spam detection app that classifies a message, a saved email (`.eml`) or a whole CSV with four very different models: **regex rules**, **statistical ML** (character n-gram Logistic Regression), a **fine-tuned DistilBERT** transformer and a **zero-shot NLI** transformer (BART). A **learned stacking ensemble** combines them into one verdict. On top of that it explains every decision word by word, checks links for phishing, resists obfuscation tricks, runs a speed-saving cascade, ships a full benchmark dashboard and learns from your feedback.
 
 ## Highlights
 
@@ -14,6 +14,7 @@ A full-stack spam detection app that classifies a message with four very differe
 | 6 | **Learned stacking ensemble** | A logistic regression trained on out-of-fold predictions learns how much to trust each model (selectable against an F1-weighted vote) |
 | 7 | **Fine-tuned DistilBERT** | A transformer fine-tuned on the dataset as a fourth model |
 | 8 | **Phishing link analysis** | Offline checks for look-alike domains (paypa1.com, Cyrillic pаypal.com), brand names on wrong domains, raw IPs, `@` tricks, punycode, shorteners and risky TLDs |
+| 9 | **Real emails and batches** | Upload a saved `.eml` email: sender/header checks (fake display names, Reply-To tricks, SPF/DKIM/DMARC failures, disguised attachments, links whose text lies about their target). Or upload a CSV of up to 2,000 messages for a summary, accuracy against your labels, and a downloadable results file |
 
 ---
 
@@ -98,6 +99,8 @@ Text_Classifier_Project/
 │   │   ├── ensemble.py                 # Stacking, weighted vote, cascade rule
 │   │   ├── normalize.py                # De-obfuscation + attack generators
 │   │   ├── link_analyzer.py            # Offline phishing-link checks
+│   │   ├── email_parser.py             # .eml parsing + sender/header checks
+│   │   ├── batch.py                    # CSV reading, column detection, batch evaluation
 │   │   └── feedback_store.py           # SQLite feedback + labelling queue
 │   ├── data/
 │   │   ├── cleaned_spam.csv            # Training dataset (UCI SMS Spam Collection, cleaned)
@@ -107,10 +110,11 @@ Text_Classifier_Project/
     ├── src/
     │   ├── App.jsx                     # Header + tabs
     │   ├── api.js                      # API client, error messages, model colours
-    │   └── components/                 # AnalyzeTab, BenchmarkTab, PlaygroundTab, FeedbackTab,
-    │                                   # HighlightedText, LinkReport, LineChart
+    │   └── components/                 # AnalyzeTab, BatchTab, BenchmarkTab, PlaygroundTab, FeedbackTab,
+    │                                   # HighlightedText, LinkReport, EmailReport, LineChart
     ├── .env.example                    # VITE_API_URL (backend address)
     └── vite.config.js
+Samples/                                # Fictional test files: phishing/legit/scam .eml + a labelled CSV
 ```
 
 ---
@@ -147,6 +151,25 @@ Every URL or bare domain is checked **offline** (nothing is fetched): look-alike
 
 ### Feedback loop (feature 5)
 👍/👎 on any result saves a label to `Backend/data/feedback.db`. Messages whose verdict was between 30% and 70%, or where the models disagreed, go to a **labelling queue**, sorted by how close they are to 50% (active learning). **Retrain** runs `train_model.py --include-feedback` in the background. Feedback joins the training side only (never the test split), and the new model, calibration and stackers are hot-reloaded without restarting. DistilBERT and the zero-shot model are not retrained by this button.
+
+### Real emails and batches (feature 9)
+**`.eml` upload** (Analyze tab → *Upload .eml*; in Gmail: ⋮ → *Download message*, in Outlook: *Save as*). The email is parsed with Python's standard `email` library. Subject + body go through the normal pipeline; HTML bodies are converted to text, and every hidden `<a href>` target is sent to the link analyser. Separately, `email_parser.py` checks the sender:
+
+| Check | Example |
+|---|---|
+| Display name claims a brand | “PayPal Security Team” sent from `gmail.com` or `paypa1-support.com` |
+| Look-alike sender domain | `paypa1-support.com` |
+| Address hidden in display name | “support@paypal.com” <x@evil.ru> |
+| Reply-To on another domain | replies secretly go to `account-verify@gmail.com` |
+| SPF / DKIM / DMARC failures | read from the `Authentication-Results` header |
+| Dangerous attachments | `.exe`, `.js`, `.html`, `.iso`, macros, double extensions like `Statement.pdf.exe` |
+| Link text that lies | shows `https://www.paypal.com/signin` but goes to `paypa1-support.com/login` |
+
+As with links, the sender risk is shown next to the verdict (with a ⛔ SUSPICIOUS SENDER badge) and is **not voted into it**, because the training data has no headers to measure it on.
+
+**Batch CSV** (Batch tab). Up to 2,000 rows (larger files are cut to the first 2,000, with a notice). The text column is detected by name (`text`, `message`, `email`, `body`, …) or as the column with the longest text; you can switch it. If a column like `label` contains only spam/ham-style values (`spam/ham`, `1/0`, `yes/no`), you also get accuracy, precision, recall, F1 and the error counts on *your* data. Rows use the cascade: fast models in one vectorised pass, the zero-shot model only for uncertain rows. Batch rows are not added to the labelling queue. Results can be filtered (spam, ham, risky links, mistakes) and downloaded as CSV.
+
+The `Samples/` folder contains fictional test files: `phishing_paypal.eml`, `legit_meeting.eml`, `prize_scam.eml` and `batch_messages.csv` (54 labelled messages).
 
 ## Limitations: SMS training data
 The dataset is the [UCI SMS Spam Collection](https://archive.ics.uci.edu/dataset/228/sms+spam+collection): short, informal text messages, mostly from the UK around 2010. The models and regex rules are tuned for that style. Long emails, HTML, modern phishing and non-English text may be classified less accurately. The cleaned dataset has no punctuation, so it contains no URLs; the link analyser is therefore rule-based and tested on hand-written cases.
@@ -189,6 +212,8 @@ App runs at `http://localhost:5173`. To use a different backend, copy `Frontend/
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/analyze` | Classify a message (see below) |
+| `POST` | `/analyze-eml` | Multipart upload: `file` (.eml, max 10 MB) plus optional `mode`, `ensemble`, `normalize`. Returns the `/analyze` response plus an `email` object (headers, auth results, attachments, `sender_checks`) |
+| `POST` | `/analyze-batch` | Multipart upload: `file` (.csv, max 10 MB, 2,000 rows), optional `column`, `ensemble`, `normalize`. Returns a summary, per-row results and, if labels are present, `evaluation` |
 | `POST` | `/robustness` | `{email_text}` → every obfuscation attack, scored with and without de-obfuscation |
 | `GET` | `/benchmark` | Everything the Benchmark tab shows |
 | `POST` | `/feedback` | `{email_text, label: "spam"\|"ham", predicted?}` → save a label |
@@ -253,8 +278,7 @@ A classifier entry can be `{"status": "error", "error": "..."}` or `{"status": "
 
 - Train on an email dataset (e.g. Enron-Spam) in addition to SMS
 - An LLM-written explanation of each verdict ("flagged because it promises a prize and asks you to call a premium number")
-- Accept `.eml` uploads (sender and headers as extra signals) and batch CSV analysis with a downloadable report
-- Containerize with Docker and deploy a live demo; Gmail add-on or browser extension
+- Containerize with Docker Compose, deploy a live demo (e.g. Hugging Face Spaces), and build a Gmail add-on or browser extension
 
 ---
 

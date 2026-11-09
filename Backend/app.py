@@ -11,11 +11,13 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AfterValidator, BaseModel
 
-from classifiers import distilbert_classifier, ensemble, feedback_store
+from classifiers import batch, distilbert_classifier, ensemble, feedback_store
+from classifiers.email_parser import check_sender, email_text_for_models, parse_eml
 from classifiers.link_analyzer import analyze_links
 from classifiers.llm_classifier import predict_llm
 from classifiers.normalize import ATTACK_DESCRIPTIONS, ATTACKS, normalize
@@ -124,19 +126,24 @@ def home():
 
 @app.post("/analyze")
 def analyze_email(request: EmailRequest):
+    return _analyze(request.email_text, request.mode, request.ensemble, request.normalize)
+
+
+def _analyze(original, mode="cascade", method="stacking", undo_obfuscation=True, link_text=None):
+    """The full single-message pipeline, shared by /analyze and /analyze-eml."""
     start = time.perf_counter()
     deadline = start + MODEL_TIMEOUT_SECONDS
 
     # Feature #4: undo obfuscation before classifying
-    text, tricks = normalize(request.email_text) if request.normalize else (request.email_text, [])
+    text, tricks = normalize(original) if undo_obfuscation else (original, [])
 
-    if request.mode == "full":
+    if mode == "full":
         results = _run({**FAST_CLASSIFIERS, **SLOW_CLASSIFIERS}, text, deadline)
         cascade = {"mode": "full", "escalated": True}
     else:
         # Feature #2: fast models first; the slow model only if they are unsure
         results = _run(FAST_CLASSIFIERS, text, deadline)
-        fast_verdict = ensemble.combine(results, request.ensemble)
+        fast_verdict = ensemble.combine(results, method)
         if fast_verdict is None or ensemble.needs_slow_models(fast_verdict):
             results.update(_run(SLOW_CLASSIFIERS, text, deadline))
             cascade = {"mode": "cascade", "escalated": True,
@@ -149,10 +156,10 @@ def analyze_email(request: EmailRequest):
                        "time_saved_ms": round(sum(_slow_ms.values()))}
         cascade.update(ensemble.config()["cascade"])
 
-    verdict = ensemble.combine(results, request.ensemble)
+    verdict = ensemble.combine(results, method)
     if verdict is None:
         raise HTTPException(status_code=503, detail="All classifiers failed; check the backend logs.")
-    other = ensemble.combine(results, "weighted" if request.ensemble == "stacking" else "stacking")
+    other = ensemble.combine(results, "weighted" if method == "stacking" else "stacking")
 
     # Feature #1: explanations on the text the models actually saw
     explanation = {"analyzed_text": text, "normalization": tricks, "regex_spans": find_spans(text)}
@@ -163,11 +170,11 @@ def analyze_email(request: EmailRequest):
         explanation["ml_words"] = []
 
     # Feature #8: link checks on the original text (normalising would hide look-alike domains)
-    links = analyze_links(request.email_text)
+    links = analyze_links(link_text if link_text is not None else original)
 
     # Feature #5: queue uncertain/disputed messages for labelling
     predictions = [r["prediction"] for r in results.values() if r["status"] == "ok"]
-    queued = feedback_store.queue_if_uncertain(request.email_text, verdict["spam_probability"], predictions)
+    queued = feedback_store.queue_if_uncertain(original, verdict["spam_probability"], predictions)
 
     return {
         **results,
@@ -178,6 +185,151 @@ def analyze_email(request: EmailRequest):
         "links": links,
         "queued_for_review": queued,
         "processing_time": round(time.perf_counter() - start, 2),
+    }
+
+
+# ------------------------------------- feature #9: real emails and batches ---
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+async def _read_upload(file: UploadFile, kinds):
+    if not file.filename or not file.filename.lower().endswith(kinds):
+        raise HTTPException(status_code=422, detail=f"Please upload a {' or '.join(kinds)} file.")
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File is larger than 10 MB.")
+    if not data.strip():
+        raise HTTPException(status_code=422, detail="The file is empty.")
+    return data
+
+
+@app.post("/analyze-eml")
+async def analyze_eml(
+    file: UploadFile = File(...),
+    mode: Literal["cascade", "full"] = Form("cascade"),
+    ensemble_method: Literal["stacking", "weighted"] = Form("stacking", alias="ensemble"),
+    normalize_text: bool = Form(True, alias="normalize"),
+):
+    """Analyses a saved email (.eml): text models on subject + body, plus
+    sender/header checks, attachments and the real targets of HTML links."""
+    data = await _read_upload(file, (".eml",))
+    try:
+        email = parse_eml(data)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not read this .eml file: {exc}") from exc
+    if not (email["from"]["address"] or email["subject"] or email["date"]):
+        raise HTTPException(status_code=422, detail="This doesn't look like an email: no From, Subject or "
+                                                    "Date header. Save the message as .eml from your mail app.")
+    text = email_text_for_models(email)
+    if not text:
+        raise HTTPException(status_code=422, detail="This email has no subject or text body to analyse.")
+
+    sender = check_sender(email)
+    # Check visible text *and* the hidden targets of HTML links
+    link_text = text + "\n" + "\n".join(link["href"] for link in email["html_links"] if link["href"])
+    # Sync model work runs in the thread pool so the event loop stays free
+    result = await run_in_threadpool(_analyze, text, mode, ensemble_method, normalize_text, link_text)
+    result["email"] = {
+        **{k: email[k] for k in ("from", "reply_to", "return_path", "to", "subject", "date", "auth",
+                                 "body_format", "attachments")},
+        "filename": file.filename,
+        "text": text,  # subject + body as given to the models (before de-obfuscation)
+        "sender_checks": sender,
+    }
+    return result
+
+
+@app.post("/analyze-batch")
+async def analyze_batch(
+    file: UploadFile = File(...),
+    column: str | None = Form(None),
+    ensemble_method: Literal["stacking", "weighted"] = Form("stacking", alias="ensemble"),
+    normalize_text: bool = Form(True, alias="normalize"),
+):
+    """Classifies every row of a CSV with the cascade (fast models for all rows,
+    the slow model only for uncertain ones). Rows are not added to the queue."""
+    data = await _read_upload(file, (".csv",))
+    try:
+        df = batch.read_csv(data)
+        if df.empty:
+            raise batch.BatchError("The CSV has no rows.")
+        text_column = batch.pick_text_column(df, column or None)
+        label_column = batch.pick_label_column(df, text_column)
+    except batch.BatchError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await run_in_threadpool(_score_batch, df, text_column, label_column, ensemble_method, normalize_text)
+
+
+def _score_batch(df, text_column, label_column, method, undo_obfuscation):
+    from classifiers import statistical_ml_classifier
+    from classifiers.regex_classifier import get_matched_rules, spam_probability, spam_score
+
+    start = time.perf_counter()
+    total = len(df)
+    df = df.head(batch.MAX_ROWS)
+    raw = df[text_column].astype(str).str.strip()
+    keep = raw != ""
+    rows_index = list(df.index[keep])
+    originals = [raw[i][:batch.MAX_TEXT] for i in rows_index]
+    texts = [normalize(t)[0] if undo_obfuscation else t for t in originals]
+    if not texts:
+        raise HTTPException(status_code=422, detail=f"Column “{text_column}” has no text.")
+
+    # Fast models, vectorised over all rows
+    probs = {
+        "regex": [spam_probability(spam_score(get_matched_rules(t))) * 100 for t in texts],
+        "ml": list(statistical_ml_classifier.spam_probabilities(texts) * 100),
+    }
+    if "distilbert" in FAST_CLASSIFIERS:
+        probs["distilbert"] = [p * 100 for p in distilbert_classifier.spam_probabilities(texts)]
+
+    labels = batch.normalise_labels(df.loc[rows_index, label_column]).tolist() if label_column else None
+    rows, escalated = [], 0
+    for k, (i, original, text) in enumerate(zip(rows_index, originals, texts)):
+        results = {m: {"status": "ok", "prediction": "spam" if p[k] >= 50 else "ham",
+                       "spam_probability": round(float(p[k]), 2)} for m, p in probs.items()}
+        verdict = ensemble.combine(results, method)
+        if ensemble.needs_slow_models(verdict):  # cascade
+            escalated += 1
+            try:
+                results["llm"] = {"status": "ok", **predict_llm(text)}
+            except Exception as exc:
+                logger.exception("zero-shot model failed on a batch row")
+                results["llm"] = {"status": "error", "error": str(exc)}
+            verdict = ensemble.combine(results, method)
+        link_report = analyze_links(original)
+        row = {
+            "row": int(i) + 2,  # spreadsheet row number (header is row 1)
+            "text": original,
+            "verdict": verdict["final_verdict"],
+            "spam_probability": verdict["spam_probability"],
+            "models": {m: r["spam_probability"] for m, r in results.items() if r["status"] == "ok"},
+            "escalated": "llm" in results,
+            "link_risk": link_report["level"],
+        }
+        if labels is not None:
+            row["label"] = labels[k]
+            row["correct"] = labels[k] == verdict["final_verdict"]
+        rows.append(row)
+
+    spam = sum(r["verdict"] == "spam" for r in rows)
+    return {
+        "text_column": text_column,
+        "columns": [str(c) for c in df.columns],
+        "label_column": label_column,
+        "total_rows": total,
+        "analyzed_rows": len(rows),
+        "truncated": total > batch.MAX_ROWS,
+        "skipped_empty": int((~keep).sum()),
+        "summary": {
+            "spam": spam, "ham": len(rows) - spam, "spam_share": round(spam / len(rows), 4),
+            "phishing_links": sum(r["link_risk"] == "high" for r in rows),
+            "escalated": escalated, "method": method,
+            "seconds": round(time.perf_counter() - start, 2),
+        },
+        "evaluation": batch.evaluate(labels, [r["verdict"] for r in rows]) if labels else None,
+        "rows": rows,
     }
 
 

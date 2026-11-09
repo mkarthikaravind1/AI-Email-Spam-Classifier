@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api, errorMessage, ENSEMBLE_COLOR, MAX_CHARS, MODELS, pct } from "../api";
+import EmailReport from "./EmailReport";
 import HighlightedText from "./HighlightedText";
 import LinkReport from "./LinkReport";
 
@@ -156,19 +157,14 @@ export default function AnalyzeTab() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const analyzeEmail = async () => {
-    if (loading) return;
-    if (!emailText.trim()) {
-      setError("Please enter an email.");
-      return;
-    }
+  const run = async (request, onSuccess) => {
     setResult(null);
     setError("");
     setLoading(true);
     try {
-      const response = await api.post("/analyze", { email_text: emailText, ...options });
+      const response = await request();
       setResult(response.data);
-      setSubmitted(emailText.trim());
+      onSuccess(response.data);
     } catch (err) {
       console.error(err);
       setError(errorMessage(err));
@@ -177,8 +173,32 @@ export default function AnalyzeTab() {
     }
   };
 
+  const analyzeEmail = () => {
+    if (loading) return;
+    if (!emailText.trim()) {
+      setError("Please enter an email.");
+      return;
+    }
+    run(() => api.post("/analyze", { email_text: emailText, ...options }), () => setSubmitted(emailText.trim()));
+  };
+
+  // Feature #9: analyse a saved email file (.eml) with its headers
+  const uploadEml = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = ""; // allow re-uploading the same file
+    if (!file || loading) return;
+    const form = new FormData();
+    form.append("file", file);
+    Object.entries(options).forEach(([k, v]) => form.append(k, String(v)));
+    run(() => api.post("/analyze-eml", form), (data) => {
+      setEmailText(data.email.text);
+      setSubmitted(data.email.text);
+    });
+  };
+
   const spam = result?.final_verdict === "spam";
   const phishing = result?.links?.level === "high";
+  const badSender = result?.email?.sender_checks?.level === "high";
 
   return (
     <div className="space-y-6">
@@ -194,13 +214,20 @@ export default function AnalyzeTab() {
             onChange={(e) => setEmailText(e.target.value)}
           />
           <div className="flex flex-wrap items-center justify-between gap-2 mt-2">
-            <button
-              onClick={analyzeEmail}
-              disabled={loading}
-              className="bg-blue-600 text-white px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {loading ? "Analyzing..." : "Analyze Email"}
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={analyzeEmail}
+                disabled={loading}
+                className="bg-blue-600 text-white px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {loading ? "Analyzing..." : "Analyze Email"}
+              </button>
+              <label className={`px-4 py-2 rounded-lg border bg-white ${loading ? "opacity-50 cursor-not-allowed" : "cursor-pointer hover:bg-gray-50"}`}
+                title="Save an email from Gmail/Outlook as .eml (Gmail: ⋮ → Download message) and upload it">
+                Upload .eml
+                <input type="file" accept=".eml,message/rfc822" className="sr-only" disabled={loading} onChange={uploadEml} />
+              </label>
+            </div>
             <span className={`text-sm ${emailText.length >= MAX_CHARS ? "text-red-600" : "text-gray-500"}`}>
               {emailText.length} / {MAX_CHARS}
             </span>
@@ -258,6 +285,7 @@ export default function AnalyzeTab() {
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
+                {badSender && <span className="px-3 py-2 rounded-full font-bold bg-gray-900 text-white">⛔ SUSPICIOUS SENDER</span>}
                 {phishing && <span className="px-3 py-2 rounded-full font-bold bg-gray-900 text-white">⛔ PHISHING LINK</span>}
                 <span className={`px-4 py-2 rounded-full font-bold text-white ${spam ? "bg-red-600" : "bg-green-700"}`}>
                   {result.final_verdict.toUpperCase()}
@@ -303,6 +331,11 @@ export default function AnalyzeTab() {
               />
             </Card>
             <div className="space-y-6">
+              {result.email && (
+                <Card title="Email & sender checks">
+                  <EmailReport email={result.email} />
+                </Card>
+              )}
               <Card title="Link safety">
                 <LinkReport links={result.links} />
               </Card>

@@ -33,12 +33,16 @@ env/
 Backend/saved_models/
 *.pkl
 
+# Personal planning notes (feature 10 deployment guide), kept local only
+FEATURE_10_DEPLOYMENT.md
+
 # User feedback labels (local, may contain personal messages)
 Backend/data/feedback.db
 
 # Datasets: the training CSV is committed so a fresh clone can train the model
 *.csv
 !Backend/data/cleaned_spam.csv
+!Samples/*.csv
 
 # Jupyter notebooks
 .ipynb_checkpoints/
