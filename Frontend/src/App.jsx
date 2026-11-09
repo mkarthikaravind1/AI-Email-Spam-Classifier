@@ -10,6 +10,23 @@ const MODELS = [
 
 const pct = (value) => `${value}%`;
 
+// Backend URL: set VITE_API_URL in Frontend/.env (see .env.example) to change it
+const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/$/, "");
+const MAX_CHARS = 5000; // must match the backend's limit
+
+// Turns an axios error into a message a user can act on
+function errorMessage(error) {
+  if (!error.response) {
+    return `Can't reach the backend at ${API_URL}. Is it running?`;
+  }
+  const detail = error.response.data?.detail;
+  if (Array.isArray(detail)) {
+    // FastAPI validation errors (422): [{ msg: "Value error, ..." }, ...]
+    return detail.map((d) => d.msg.replace(/^Value error, /, "")).join("; ");
+  }
+  return detail || `The backend returned an error (HTTP ${error.response.status}).`;
+}
+
 function ModelCard({ model, data, weight }) {
   return (
     <div className="bg-white p-3 rounded-xl shadow-md">
@@ -51,34 +68,38 @@ function App() {
   const [emailText, setEmailText] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
   const analyzeEmail = async () => {
+    if (loading) return;
     if (!emailText.trim()) {
-      alert("Please enter an email.");
+      setError("Please enter an email.");
       return;
     }
 
+    // Clear the previous result so it is never shown next to a new input
+    setResult(null);
+    setError("");
     setLoading(true);
 
     try {
-      const response = await axios.post("http://localhost:8000/analyze", {
+      const response = await axios.post(`${API_URL}/analyze`, {
         email_text: emailText,
       });
-
       setResult(response.data);
-    } catch (error) {
-      console.error(error);
-      alert("Backend connection failed.");
+    } catch (err) {
+      console.error(err);
+      setError(errorMessage(err));
+    } finally {
+      setLoading(false);
     }
-
-    setLoading(false);
   };
 
   return (
-    <div className="min-h-screen bg-gray-100 p-8">
+    <div className="min-h-screen bg-gray-100 p-4 sm:p-8">
       <div className="max-w-screen-xl mx-auto">
 
-        <h1 className="text-4xl font-bold text-left mb-2">
+        <h1 className="text-3xl sm:text-4xl font-bold text-left mb-2">
           AI Email Spam Classifier
         </h1>
 
@@ -99,19 +120,31 @@ function App() {
               className="w-full border rounded-lg p-4 h-40 bg-white"
               placeholder="Paste email text here..."
               value={emailText}
+              maxLength={MAX_CHARS}
               onChange={(e) => setEmailText(e.target.value)}
             />
-            <button
-              onClick={analyzeEmail}
-              className="mt-2 bg-blue-600 text-white px-3 py-2 rounded-lg"
-            >
-              Analyze Email
-            </button>
+            <div className="flex items-center justify-between mt-2">
+              <button
+                onClick={analyzeEmail}
+                disabled={loading}
+                className="bg-blue-600 text-white px-3 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {loading ? "Analyzing..." : "Analyze Email"}
+              </button>
+              <span className={`text-sm ${emailText.length >= MAX_CHARS ? "text-red-600" : "text-gray-500"}`}>
+                {emailText.length} / {MAX_CHARS}
+              </span>
+            </div>
+            {error && (
+              <p role="alert" className="mt-3 p-3 rounded-lg bg-red-100 text-red-700">
+                {error}
+              </p>
+            )}
           </div>
 
           {/* Right: 3 Model Cards (only shown after result) */}
           {result && (
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-3 md:grid-cols-1 xl:grid-cols-3 gap-3">
               {MODELS.map((model) => (
                 <ModelCard
                   key={model.key}
@@ -127,8 +160,8 @@ function App() {
 
         {/* Loading Indicator — outside result block so it shows during fetch */}
         {loading && (
-          <div className="mt-6">
-            <p>Analyzing...</p>
+          <div className="mt-6" aria-live="polite">
+            <p>Analyzing... (the first request can take a while while the models warm up)</p>
           </div>
         )}
 
@@ -142,7 +175,8 @@ function App() {
               {/* Model Comparison Table */}
               <div className="bg-white p-6 rounded-xl shadow-lg">
                 <h2 className="text-2xl font-bold mb-4">Model Comparison</h2>
-                <table className="w-full border-collapse">
+                <div className="overflow-x-auto">
+                <table className="w-full border-collapse min-w-[28rem]">
                   <thead>
                     <tr className="border-b">
                       <th className="text-left p-2">Model</th>
@@ -173,6 +207,7 @@ function App() {
                     })}
                   </tbody>
                 </table>
+                </div>
               </div>
 
               {/* Final Verdict — bg color reflects spam/ham */}

@@ -43,6 +43,7 @@ Backend/saved_models/
 # Environment variables
 .env
 .env.*
+!.env.example
 
 # =========================
 # IDE files

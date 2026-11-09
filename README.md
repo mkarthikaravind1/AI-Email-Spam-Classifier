@@ -138,6 +138,8 @@ npm run dev
 
 App runs at `http://localhost:5173` (default Vite port).
 
+The frontend calls the backend at `http://localhost:8000` by default. To use a different backend, copy `Frontend/.env.example` to `Frontend/.env`, set `VITE_API_URL`, and restart `npm run dev`. Also add the frontend's URL to the backend's `ALLOWED_ORIGINS`.
+
 ## API Reference
 
 ### `POST /analyze`
@@ -194,7 +196,9 @@ Health check. Returns `{"message": "Backend running", "weights": {...}}`.
 
 ## Frontend Features
 
-- Textarea input with a single **Analyze Email** action
+- Textarea input with a character counter (5000 max, same limit as the API) and an **Analyze Email** button that is disabled while a request runs
+- Clear inline error messages: backend not reachable, validation errors from the API, or all models failing
+- Responsive layout: model cards stack on phones and the comparison table scrolls horizontally if needed
 - Three side-by-side model cards showing prediction, confidence, spam-probability bar, vote weight, and (for regex) matched rules; a failed model shows "Unavailable" instead
 - Model comparison table across all three classifiers
 - Color-coded final verdict panel (green = ham, red = spam) with weighted spam probability, agreement and processing time
