@@ -1,6 +1,6 @@
 # AI Email Spam Classifier
 
-A full-stack spam detection app that classifies email text using three independent approaches — **Regex rules**, **Statistical ML (Logistic Regression)**, and an **LLM (zero-shot classification)** — then combines their outputs via majority voting into a single verdict.
+A full-stack spam detection app that classifies email text using three independent approaches — **Regex rules**, **Statistical ML (Logistic Regression)**, and a **zero-shot NLI transformer (BART)**. It then combines their outputs with a weighted vote into a single verdict.
 
 ## Overview
 
@@ -10,14 +10,31 @@ Most spam classifiers rely on a single model. This project compares three fundam
 |---|---|---|
 | Regex | Weighted keyword/pattern rules | Python `re` |
 | Statistical ML | Character n-gram TF-IDF + class-balanced Logistic Regression | `scikit-learn` |
-| LLM | Zero-shot classification | `transformers` (`facebook/bart-large-mnli`) |
+| Zero-shot NLI | Zero-shot classification | `transformers` (`facebook/bart-large-mnli`) |
 
-The backend runs all three on every request and returns a **majority-vote final verdict**, along with per-classifier confidence scores and processing time.
+The backend runs all three in parallel on every request and returns a **weighted-vote final verdict**, along with each classifier's spam probability, confidence, vote weight and the processing time.
 
 ---
+
 ## System Architecture
 
-![System Architecture](Screenshots/architecture.png)
+```mermaid
+flowchart TD
+    U[User] --> FE["React frontend<br/>text input, results dashboard"]
+    FE -- "POST /analyze {email_text}" --> API["FastAPI backend<br/>validates input, 30 s timeout"]
+    API --> R["Regex rules<br/>weighted patterns, learned P(spam | score)"]
+    API --> M["Statistical ML<br/>char n-gram TF-IDF + Logistic Regression"]
+    API --> L["Zero-shot NLI<br/>facebook/bart-large-mnli"]
+    R --> E
+    M --> E
+    L --> E
+    E["Weighted ensemble<br/>average of spam probabilities,<br/>weights = validation F1 (metrics.json)"] --> V["Final verdict<br/>spam if ≥ 50%"]
+    V -- "JSON response" --> FE
+    T[train_model.py] -. "spam_model.pkl, metrics.json" .-> M
+    T -. "regex calibration, weights" .-> E
+```
+
+A failed or timed-out classifier is skipped, and the verdict comes from the others.
 
 ---
 
@@ -36,6 +53,7 @@ Text_Classifier_Project/
 │   ├── requirements.txt                # Pinned Python dependencies
 │   ├── classifiers/
 │   │   ├── text_utils.py               # Shared paths, dataset loading, text cleaning
+│   │   ├── ensemble.py                 # Weighted vote combining the three classifiers
 │   │   ├── regex_classifier.py         # Weighted regex rule engine
 │   │   ├── statistical_ml_classifier.py # Logistic Regression inference
 │   │   └── llm_classifier.py           # Zero-shot BART classifier
@@ -49,19 +67,17 @@ Text_Classifier_Project/
     │   ├── App.jsx                     # Main UI (input, results, comparison)
     │   ├── main.jsx
     │   └── index.css
+    ├── .env.example                    # VITE_API_URL (backend address)
     └── vite.config.js
 ```
 
 ---
+
 ## Screenshot
 
-![System Architecture](Screenshots/demo.png)
+![App screenshot](Screenshots/demo.png)
 
 ---
-
-
-
-
 
 ## How Each Classifier Works
 
