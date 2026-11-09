@@ -4,6 +4,7 @@ The dataset in data/cleaned_spam.csv was pre-cleaned (lowercased, punctuation
 and NLTK English stop words removed). Live input arrives raw, so we apply the
 same cleaning at inference time to avoid train/serve skew.
 """
+import json
 import re
 from pathlib import Path
 
@@ -43,6 +44,13 @@ def load_dataset():
     df = df.dropna(subset=["text"])
     # Exact duplicates would leak between train and test splits
     return df.drop_duplicates(subset="text").reset_index(drop=True)
+
+
+def load_metrics():
+    """Returns metrics.json written by train_model.py, or {} if it does not exist."""
+    if METRICS_PATH.exists():
+        return json.loads(METRICS_PATH.read_text())
+    return {}
 
 
 def clean_text(text):

@@ -66,7 +66,7 @@ Text_Classifier_Project/
 ## How Each Classifier Works
 
 ### 1. Regex Classifier
-Scans the text for spam-indicative patterns (free offers, prizes, urgency phrases, money amounts, links, reward claims, SMS short codes, premium-rate numbers, subscription terms), each carrying a weight. Scores ≥ 3 are flagged as spam. Returns the matched rules alongside the prediction.
+Scans the text for spam-indicative patterns (free offers, prizes, urgency phrases, money amounts, links, reward claims, SMS short codes, premium-rate numbers, subscription terms), each carrying a weight. The summed score is turned into a real spam probability using a table learned from the training data (`P(spam | score)`, smoothed and never decreasing). For example, a score of 0 is spam ~2% of the time and a score ≥ 3 ~98% of the time. Messages with ≥ 50% spam probability are flagged. Returns the matched rules alongside the prediction.
 
 ### 2. Statistical ML Classifier
 A single scikit-learn `Pipeline`: text cleaning (the same cleaning used to build the dataset) → character n-gram `TfidfVectorizer` → `LogisticRegression(class_weight="balanced")`. Character n-grams tolerate misspellings like "fr33", and balanced class weights compensate for spam being only ~13% of the data. `train_model.py` removes duplicate messages, compares against the original Naive Bayes baseline on a held-out 20% split, prints the reports, then refits on all data and saves `spam_model.pkl` plus `metrics.json`.
@@ -76,11 +76,28 @@ A single scikit-learn `Pipeline`: text cleaning (the same cleaning used to build
 | TF-IDF + Naive Bayes (old) | 1.000 | 0.619 | 0.765 |
 | Char n-gram + Logistic Regression | 0.967 | 0.937 | 0.952 |
 
-### 3. LLM Classifier
-Uses HuggingFace's zero-shot classification pipeline with `facebook/bart-large-mnli`. The model scores how well "This text is {label}." fits the message, so it is given descriptive labels (`"a promotion or prize offer"` / `"a normal personal message"`) that are mapped back to spam/ham. The jargon label `"ham"` is meaningless to it and gave coin-flip accuracy.
+### 3. Zero-shot NLI Classifier (the `llm` key in the API)
+Uses HuggingFace's zero-shot classification pipeline with `facebook/bart-large-mnli`, a BART model fine-tuned for natural-language inference (NLI). It is a transformer language model, but not a generative chat LLM. The model scores how well "This text is {label}." fits the message, so it is given descriptive labels (`"a promotion or prize offer"` / `"a normal personal message"`) that are mapped back to spam/ham. The jargon label `"ham"` is meaningless to it and gave coin-flip accuracy.
 
-### Final Verdict
-The backend tallies the three predictions; whichever label (`spam`/`ham`) gets the majority vote becomes the `final_verdict`, reported with an agreement ratio (e.g. `2/3`).
+### Final Verdict: weighted ensemble
+Every classifier returns a `spam_probability`, and `confidence` always means confidence in the label it predicted. The backend takes a weighted average of the spam probabilities, where each model's weight is its spam F1 score measured on validation data by `train_model.py` (stored in `saved_models/metrics.json`). The message is spam if the weighted probability is ≥ 50%. This replaces a plain majority vote, where the weakest model counted as much as the strongest. `agreement` reports how many of the models that ran agree with the verdict.
+
+Results from `python train_model.py --with-llm` (the zero-shot model is slow on CPU, so ensemble numbers use a 400-message stratified sample of the test split):
+
+| Held-out test set | Spam precision | Spam recall | Spam F1 | Ensemble weight |
+|---|---|---|---|---|
+| Regex rules (calibrated) | 0.954 | 0.825 | 0.885 | 0.88 |
+| Statistical ML | 0.967 | 0.937 | 0.952 | 0.95 |
+| Zero-shot NLI | 0.204 | 0.878 | 0.331 | 0.30 |
+| Old majority vote (400 sample) | 0.935 | 0.878 | 0.905 | |
+| **Weighted ensemble (400 sample)** | **0.977** | 0.857 | **0.913** | |
+
+On the same 400 messages the ML model alone scores F1 0.926, so the ensemble mainly adds explainability and resilience, not accuracy. The weighting stops the weak zero-shot model from causing false alarms. For example, "I won the match yesterday!" is spam under majority vote (regex + zero-shot) but ham under the weighted vote.
+
+The three classifiers run in parallel. If one fails or exceeds `MODEL_TIMEOUT_SECONDS` (default 30), its card shows the error and the verdict is made from the remaining models. The API only returns 503 if all of them fail.
+
+## Limitations: SMS training data
+The dataset is the [UCI SMS Spam Collection](https://archive.ics.uci.edu/dataset/228/sms+spam+collection): short, informal text messages, mostly from the UK around 2010. The models and regex rules (short codes, premium-rate numbers, ringtone offers) are tuned for that style. Long emails, HTML, modern phishing and non-English text may be classified less accurately. Adding an email dataset such as Enron-Spam is listed under Possible Improvements.
 
 ## Setup
 
@@ -90,8 +107,13 @@ The backend tallies the three predictions; whichever label (`spam`/`ham`) gets t
 cd Backend
 pip install -r requirements.txt
 
-# Train the statistical model (generates saved_models/spam_model.pkl)
+# Train the ML model and measure regex calibration + ensemble weights
+# (generates saved_models/spam_model.pkl and metrics.json)
 python train_model.py
+
+# Optional: also measure the zero-shot model so it gets a real ensemble
+# weight instead of the default 1.0 (takes a few minutes on CPU)
+python train_model.py --with-llm
 
 # Run the API (first start downloads the ~1.6 GB BART model)
 python -m uvicorn app:app --reload
@@ -131,43 +153,59 @@ App runs at `http://localhost:5173` (default Vite port).
 ```json
 {
   "regex": {
+    "status": "ok",
     "prediction": "spam",
+    "spam_probability": 98.75,
+    "confidence": 98.75,
     "score": 9,
-    "confidence": 90.0,
     "matched_rules": ["free_offer", "win_prize", "urgent_action", "money_offer", "claim_reward"]
   },
   "ml": {
+    "status": "ok",
     "prediction": "spam",
+    "spam_probability": 99.5,
     "confidence": 99.5
   },
   "llm": {
+    "status": "ok",
     "prediction": "spam",
+    "spam_probability": 99.25,
     "confidence": 99.25
   },
   "final_verdict": "spam",
+  "spam_probability": 99.16,
   "agreement": "3/3",
+  "weights": {"regex": 0.413, "ml": 0.447, "llm": 0.14},
   "processing_time": 0.18
 }
 ```
 
+If a classifier fails, its entry is `{"status": "error", "error": "..."}` and it is left out of `weights` and `agreement`.
+
 ### `GET /`
-Health check — returns `{"message": "Backend running"}`.
+Health check. Returns `{"message": "Backend running", "weights": {...}}`.
+
+### Configuration (environment variables)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ALLOWED_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated origins allowed by CORS |
+| `MODEL_TIMEOUT_SECONDS` | `30` | Max time to wait for the classifiers per request |
 
 ## Frontend Features
 
 - Textarea input with a single **Analyze Email** action
-- Three side-by-side model cards showing prediction, confidence bar, and (for regex) matched rules
+- Three side-by-side model cards showing prediction, confidence, spam-probability bar, vote weight, and (for regex) matched rules; a failed model shows "Unavailable" instead
 - Model comparison table across all three classifiers
-- Color-coded final verdict panel (green = ham, red = spam) with agreement ratio and processing time
-- Static pipeline visualization showing the classification flow
+- Color-coded final verdict panel (green = ham, red = spam) with weighted spam probability, agreement and processing time
+- Pipeline diagram showing the three classifiers running in parallel into the weighted vote
 
 ## Possible Improvements
 
-- Replace majority voting with a weighted ensemble based on each model's historical accuracy
-- Cache the BART model load to avoid reloading on every backend restart
+- Train on an email dataset (e.g. Enron-Spam) in addition to SMS
+- Learn the ensemble with a small stacking model instead of F1-based weights
 - Add request history / logging for analyzed emails
 - Containerize backend + frontend with Docker for easier deployment
-- Swap `allow_origins=["*"]` for explicit origins before production use
 
 ---
 

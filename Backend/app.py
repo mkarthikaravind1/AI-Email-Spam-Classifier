@@ -1,26 +1,51 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from concurrent.futures import ThreadPoolExecutor
+import logging
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
-from classifiers.regex_classifier import predict_regex
-from classifiers.statistical_ml_classifier import predict_ml
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, field_validator
+
+from classifiers.ensemble import combine, load_weights
 from classifiers.llm_classifier import predict_llm
+from classifiers.regex_classifier import predict_regex
+from classifiers.statistical_ml_classifier import load_model, predict_ml
+
+logger = logging.getLogger("spam_classifier")
+
+# Fail at startup with a clear message if the ML model hasn't been trained yet
+load_model()
+WEIGHTS = load_weights()
+
+# Max seconds to wait for all classifiers; a model that is slower is reported
+# as an error and the verdict is made from the models that finished.
+MODEL_TIMEOUT_SECONDS = float(os.getenv("MODEL_TIMEOUT_SECONDS", "30"))
+
+# Only the frontend's own origin(s) may call the API. Override with a
+# comma-separated list, e.g. ALLOWED_ORIGINS=https://myapp.example.com
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+).split(",")
+
+CLASSIFIERS = {
+    "regex": predict_regex,
+    "ml": predict_ml,
+    "llm": predict_llm,
+}
 
 app = FastAPI(title="AI Email Spam Classifier")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
-executor = ThreadPoolExecutor(max_workers=3)
+executor = ThreadPoolExecutor(max_workers=len(CLASSIFIERS))
 
-from pydantic import BaseModel, field_validator
 
 class EmailRequest(BaseModel):
     email_text: str
@@ -35,108 +60,37 @@ class EmailRequest(BaseModel):
             raise ValueError("email_text exceeds 5000 character limit")
         return v
 
+
 @app.get("/")
 def home():
-    return {"message": "Backend running"}
+    return {"message": "Backend running", "weights": WEIGHTS}
+
 
 @app.post("/analyze")
 def analyze_email(request: EmailRequest):
-    start_time = time.time()
+    start_time = time.perf_counter()
+    deadline = start_time + MODEL_TIMEOUT_SECONDS
 
-    future_regex = executor.submit(predict_regex, request.email_text)
-    future_ml = executor.submit(predict_ml, request.email_text)
-    future_llm = executor.submit(predict_llm, request.email_text)
+    # All three classifiers run in parallel
+    futures = {name: executor.submit(fn, request.email_text) for name, fn in CLASSIFIERS.items()}
 
-    regex_result = future_regex.result()
-    ml_result = future_ml.result()
-    llm_result = future_llm.result()
+    results = {}
+    for name, future in futures.items():
+        try:
+            remaining = max(0.0, deadline - time.perf_counter())
+            results[name] = {"status": "ok", **future.result(timeout=remaining)}
+        except FutureTimeoutError:
+            results[name] = {"status": "error", "error": f"timed out after {MODEL_TIMEOUT_SECONDS:g}s"}
+        except Exception as exc:  # one broken model must not take down the request
+            logger.exception("%s classifier failed", name)
+            results[name] = {"status": "error", "error": str(exc) or type(exc).__name__}
 
-    end_time = time.time()
-
-    votes = [regex_result["prediction"], ml_result["prediction"], llm_result["prediction"]]
-    spam_votes = votes.count("spam")
-    ham_votes = votes.count("ham")
-
-    if spam_votes > ham_votes:
-        final_verdict = "spam"
-        agreement = f"{spam_votes}/3"
-    else:
-        final_verdict = "ham"
-        agreement = f"{ham_votes}/3"
+    verdict = combine(results, WEIGHTS)
+    if verdict is None:
+        raise HTTPException(status_code=503, detail="All classifiers failed; check the backend logs.")
 
     return {
-        "regex": regex_result,
-        "ml": ml_result,
-        "llm": llm_result,
-        "final_verdict": final_verdict,
-        "agreement": agreement,
-        "processing_time": round(end_time - start_time, 2)
+        **results,
+        **verdict,
+        "processing_time": round(time.perf_counter() - start_time, 2),
     }
-
-#Old code(SEQUENTIAL EXECUTION)
-# from fastapi import FastAPI
-# from fastapi.middleware.cors import CORSMiddleware
-# from pydantic import BaseModel
-
-# from classifiers.regex_classifier import predict_regex
-# from classifiers.statistical_ml_classifier import predict_ml
-# from classifiers.llm_classifier import predict_llm
-# import time
-
-# # Initialises FastAPI
-# app = FastAPI(title="AI Email Spam Classifier")
-
-# # Enables cross-origin requests (allows frontend on a different port/domain to call this API)
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# # Request schema - expects a single email_text string
-# class EmailRequest(BaseModel):
-#     email_text: str
-
-# # Health check endpoint
-# @app.get("/")
-# def home():
-#     return {"message": "Backend running"}
-
-# # Analyzes the email based on teh output of the 3 classifiers
-# @app.post("/analyze")
-# def analyze_email(request: EmailRequest):
-#     start_time = time.time()
-
-#     regex_result = predict_regex(request.email_text)
-#     ml_result = predict_ml(request.email_text)
-#     llm_result = predict_llm(request.email_text)
-
-#     end_time = time.time()
-
-#     votes = [
-#         regex_result["prediction"],
-#         ml_result["prediction"],
-#         llm_result["prediction"]
-#     ]
-
-#     # Majority vote across 3 classifiers to determine final verdict
-#     spam_votes = votes.count("spam")
-#     ham_votes = votes.count("ham")
-
-#     if spam_votes > ham_votes:
-#         final_verdict = "spam"
-#         agreement = f"{spam_votes}/3"
-#     else:
-#         final_verdict = "ham"
-#         agreement = f"{ham_votes}/3"
-
-#     return {
-#         "regex": regex_result,
-#         "ml": ml_result,
-#         "llm": llm_result,
-#         "final_verdict": final_verdict,
-#         "agreement": agreement,
-#         "processing_time": round(end_time - start_time, 2)
-#     }
