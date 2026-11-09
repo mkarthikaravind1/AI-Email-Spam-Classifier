@@ -1,5 +1,16 @@
+Backend (first time):
+cd Backend
+pip install -r requirements.txt
+python train_model.py
+
+Backend (every time):
 cd Backend
 python -m uvicorn app:app --reload
 
+Frontend (first time):
+cd Frontend
+npm install
+
+Frontend (every time):
 cd Frontend
 npm run dev

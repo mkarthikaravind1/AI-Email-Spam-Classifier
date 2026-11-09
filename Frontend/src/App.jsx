@@ -188,7 +188,7 @@ function App() {
                   <p>↓</p>
                   <p>Regex Classifier</p>
                   <p>↓</p>
-                  <p>Statistical ML (Naive Bayes)</p>
+                  <p>Statistical ML (Logistic Regression)</p>
                   <p>↓</p>
                   <p>BART LLM</p>
                   <p>↓</p>

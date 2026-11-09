@@ -1,31 +1,27 @@
 import joblib
 
-# Loads the saved naive_bayes & tfidf 
-model = joblib.load(
-    "saved_models/naive_bayes.pkl"
-)
-tfidf = joblib.load(
-    "saved_models/tfidf.pkl"
-)
+from classifiers.text_utils import MODEL_PATH
+
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(
+        f"Trained model not found at {MODEL_PATH}. Run `python train_model.py` "
+        "from the Backend folder first."
+    )
+
+# A single sklearn Pipeline: text cleaning + TF-IDF + classifier
+model = joblib.load(MODEL_PATH)
+
 
 # Predicts based on the trained ML model
 def predict_ml(custom_text):
-    transformed_text = tfidf.transform(
-        [custom_text]
-    )
-    prediction = model.predict(
-        transformed_text
-    )[0]
-    probabilities = model.predict_proba(
-        transformed_text
-    )[0]
-
-    confidence = max(probabilities) * 100
+    probabilities = model.predict_proba([custom_text])[0]
+    best = probabilities.argmax()
 
     return {
-        "prediction": prediction,
-        "confidence": round(confidence, 2)
+        "prediction": str(model.classes_[best]),
+        "confidence": round(float(probabilities[best]) * 100, 2),
     }
+
 
 # Tests the model with a ham and spam example
 if __name__ == "__main__":

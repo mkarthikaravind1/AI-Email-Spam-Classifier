@@ -29,13 +29,13 @@ venv/
 env/
 .venv/
 
-# Saved ML models
+# Saved ML models (regenerate with: python train_model.py)
 Backend/saved_models/
 *.pkl
 
-# Datasets
-Backend/data/
+# Datasets: the training CSV is committed so a fresh clone can train the model
 *.csv
+!Backend/data/cleaned_spam.csv
 
 # Jupyter notebooks
 .ipynb_checkpoints/
