@@ -1,96 +1,295 @@
+import json
 import logging
 import os
+import subprocess
+import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
+from typing import Annotated, Literal
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from pydantic import AfterValidator, BaseModel
 
-from classifiers.ensemble import combine, load_weights
+from classifiers import distilbert_classifier, ensemble, feedback_store
+from classifiers.link_analyzer import analyze_links
 from classifiers.llm_classifier import predict_llm
-from classifiers.regex_classifier import predict_regex
-from classifiers.statistical_ml_classifier import load_model, predict_ml
+from classifiers.normalize import ATTACK_DESCRIPTIONS, ATTACKS, normalize
+from classifiers.regex_classifier import find_spans, predict_regex, reload_calibration
+from classifiers.statistical_ml_classifier import explain_ml, load_model, predict_ml
+from classifiers.text_utils import BACKEND_DIR, MODEL_DIR, load_metrics
 
 logger = logging.getLogger("spam_classifier")
 
 # Fail at startup with a clear message if the ML model hasn't been trained yet
 load_model()
-WEIGHTS = load_weights()
+ensemble.reload_config()
+feedback_store.init()
 
-# Max seconds to wait for all classifiers; a model that is slower is reported
-# as an error and the verdict is made from the models that finished.
 MODEL_TIMEOUT_SECONDS = float(os.getenv("MODEL_TIMEOUT_SECONDS", "30"))
-
-# Only the frontend's own origin(s) may call the API. Override with a
-# comma-separated list, e.g. ALLOWED_ORIGINS=https://myapp.example.com
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
 ).split(",")
+BENCHMARK_PATH = MODEL_DIR / "benchmark.json"
 
-CLASSIFIERS = {
-    "regex": predict_regex,
-    "ml": predict_ml,
-    "llm": predict_llm,
-}
+FAST_CLASSIFIERS = {"regex": predict_regex, "ml": predict_ml}
+if distilbert_classifier.available():
+    FAST_CLASSIFIERS["distilbert"] = distilbert_classifier.predict_distilbert
+    distilbert_classifier.spam_probabilities(["warm up"])  # load now, not on the first request
+SLOW_CLASSIFIERS = {"llm": predict_llm}
 
 app = FastAPI(title="AI Email Spam Classifier")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
 )
+executor = ThreadPoolExecutor(max_workers=8)
 
-executor = ThreadPoolExecutor(max_workers=len(CLASSIFIERS))
+# Running average of how long the slow model takes, to report time the cascade
+# saved; starts from the latency measured by train_model.py --with-llm
+def _measured_llm_ms():
+    try:
+        return float(json.loads((MODEL_DIR / "llm_preds.json").read_text())["ms_per_message"])
+    except (OSError, KeyError, ValueError):
+        return 1000.0
+
+
+_slow_ms = {"llm": _measured_llm_ms()}
+
+
+def _validate(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("email_text cannot be empty")
+    if len(v) > 5000:
+        raise ValueError("email_text exceeds 5000 character limit")
+    return v
+
+
+# Message text: stripped, non-empty, at most 5000 characters
+EmailText = Annotated[str, AfterValidator(_validate)]
 
 
 class EmailRequest(BaseModel):
-    email_text: str
-
-    @field_validator("email_text")
-    @classmethod
-    def validate_text(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("email_text cannot be empty")
-        if len(v) > 5000:
-            raise ValueError("email_text exceeds 5000 character limit")
-        return v
+    email_text: EmailText
+    mode: Literal["cascade", "full"] = "cascade"
+    ensemble: Literal["stacking", "weighted"] = "stacking"
+    normalize: bool = True
 
 
-@app.get("/")
-def home():
-    return {"message": "Backend running", "weights": WEIGHTS}
+class TextRequest(BaseModel):
+    email_text: EmailText
 
 
-@app.post("/analyze")
-def analyze_email(request: EmailRequest):
-    start_time = time.perf_counter()
-    deadline = start_time + MODEL_TIMEOUT_SECONDS
+class FeedbackRequest(BaseModel):
+    email_text: EmailText
+    label: Literal["spam", "ham"]
+    predicted: Literal["spam", "ham"] | None = None
 
-    # All three classifiers run in parallel
-    futures = {name: executor.submit(fn, request.email_text) for name, fn in CLASSIFIERS.items()}
 
+def _run(classifiers, text, deadline):
+    """Runs classifiers in parallel; a failing or slow one becomes an error entry."""
+    futures = {name: (executor.submit(fn, text), time.perf_counter()) for name, fn in classifiers.items()}
     results = {}
-    for name, future in futures.items():
+    for name, (future, started) in futures.items():
         try:
-            remaining = max(0.0, deadline - time.perf_counter())
-            results[name] = {"status": "ok", **future.result(timeout=remaining)}
+            results[name] = {"status": "ok", **future.result(timeout=max(0.0, deadline - time.perf_counter()))}
+            if name in _slow_ms:
+                _slow_ms[name] = 0.8 * _slow_ms[name] + 0.2 * (time.perf_counter() - started) * 1000
         except FutureTimeoutError:
             results[name] = {"status": "error", "error": f"timed out after {MODEL_TIMEOUT_SECONDS:g}s"}
         except Exception as exc:  # one broken model must not take down the request
             logger.exception("%s classifier failed", name)
             results[name] = {"status": "error", "error": str(exc) or type(exc).__name__}
+    return results
 
-    verdict = combine(results, WEIGHTS)
+
+@app.get("/")
+def home():
+    cfg = ensemble.config()
+    return {
+        "message": "Backend running",
+        "models": list(FAST_CLASSIFIERS) + list(SLOW_CLASSIFIERS),
+        "weights": cfg["weights"],
+        "stacking": cfg["stacking"],
+        "cascade": cfg["cascade"],
+    }
+
+
+@app.post("/analyze")
+def analyze_email(request: EmailRequest):
+    start = time.perf_counter()
+    deadline = start + MODEL_TIMEOUT_SECONDS
+
+    # Feature #4: undo obfuscation before classifying
+    text, tricks = normalize(request.email_text) if request.normalize else (request.email_text, [])
+
+    if request.mode == "full":
+        results = _run({**FAST_CLASSIFIERS, **SLOW_CLASSIFIERS}, text, deadline)
+        cascade = {"mode": "full", "escalated": True}
+    else:
+        # Feature #2: fast models first; the slow model only if they are unsure
+        results = _run(FAST_CLASSIFIERS, text, deadline)
+        fast_verdict = ensemble.combine(results, request.ensemble)
+        if fast_verdict is None or ensemble.needs_slow_models(fast_verdict):
+            results.update(_run(SLOW_CLASSIFIERS, text, deadline))
+            cascade = {"mode": "cascade", "escalated": True,
+                       "reason": "fast models were uncertain" if fast_verdict else "fast models failed"}
+        else:
+            for name in SLOW_CLASSIFIERS:
+                results[name] = {"status": "skipped", "reason": "fast models were confident"}
+            cascade = {"mode": "cascade", "escalated": False,
+                       "fast_spam_probability": fast_verdict["spam_probability"],
+                       "time_saved_ms": round(sum(_slow_ms.values()))}
+        cascade.update(ensemble.config()["cascade"])
+
+    verdict = ensemble.combine(results, request.ensemble)
     if verdict is None:
         raise HTTPException(status_code=503, detail="All classifiers failed; check the backend logs.")
+    other = ensemble.combine(results, "weighted" if request.ensemble == "stacking" else "stacking")
+
+    # Feature #1: explanations on the text the models actually saw
+    explanation = {"analyzed_text": text, "normalization": tricks, "regex_spans": find_spans(text)}
+    try:
+        explanation["ml_words"] = explain_ml(text)
+    except Exception:
+        logger.exception("ML explanation failed")
+        explanation["ml_words"] = []
+
+    # Feature #8: link checks on the original text (normalising would hide look-alike domains)
+    links = analyze_links(request.email_text)
+
+    # Feature #5: queue uncertain/disputed messages for labelling
+    predictions = [r["prediction"] for r in results.values() if r["status"] == "ok"]
+    queued = feedback_store.queue_if_uncertain(request.email_text, verdict["spam_probability"], predictions)
 
     return {
         **results,
         **verdict,
-        "processing_time": round(time.perf_counter() - start_time, 2),
+        "alternative": other,
+        "cascade": cascade,
+        "explanation": explanation,
+        "links": links,
+        "queued_for_review": queued,
+        "processing_time": round(time.perf_counter() - start, 2),
     }
+
+
+# ------------------------------------------------- feature #4: robustness ---
+
+@app.post("/robustness")
+def robustness(request: TextRequest):
+    """Attacks the message with each obfuscation trick and shows which fast
+    models still catch it, with and without de-obfuscation."""
+    from classifiers import statistical_ml_classifier
+    from classifiers.regex_classifier import get_matched_rules, spam_probability, spam_score
+
+    base = request.email_text
+    variants = [("original", "No obfuscation", base)] + [
+        (name, ATTACK_DESCRIPTIONS[name], attack(base)) for name, attack in ATTACKS.items()
+    ]
+    texts = [v[2] for v in variants]
+    fixed = [normalize(t)[0] for t in texts]
+
+    def score(batch):
+        probs = {
+            "regex": [spam_probability(spam_score(get_matched_rules(t))) * 100 for t in batch],
+            "ml": list(statistical_ml_classifier.spam_probabilities(batch) * 100),
+        }
+        if "distilbert" in FAST_CLASSIFIERS:
+            probs["distilbert"] = list(np.array(distilbert_classifier.spam_probabilities(batch)) * 100)
+        rows = []
+        for i in range(len(batch)):
+            results = {m: {"status": "ok", "prediction": "spam" if p[i] >= 50 else "ham",
+                           "spam_probability": round(float(p[i]), 2)} for m, p in probs.items()}
+            rows.append({"models": {m: r["spam_probability"] for m, r in results.items()},
+                         "ensemble": ensemble.combine_stacking(results)["spam_probability"]})
+        return rows
+
+    raw_scores, fixed_scores = score(texts), score(fixed)
+    return {"variants": [
+        {"name": name, "description": desc, "text": text, "normalized_text": norm,
+         "raw": raw, "normalized": fix}
+        for (name, desc, text), norm, raw, fix in zip(variants, fixed, raw_scores, fixed_scores)
+    ]}
+
+
+# --------------------------------------------------- feature #3: benchmark ---
+
+@app.get("/benchmark")
+def benchmark():
+    if not BENCHMARK_PATH.exists():
+        raise HTTPException(status_code=404, detail="No benchmark yet: run python train_model.py")
+    return json.loads(BENCHMARK_PATH.read_text())
+
+
+# ------------------------------------------------ feature #5: feedback loop ---
+
+@app.post("/feedback")
+def add_feedback(request: FeedbackRequest):
+    feedback_store.add_feedback(request.email_text, request.label, request.predicted)
+    return feedback_store.stats()
+
+
+@app.get("/feedback/stats")
+def feedback_stats():
+    return {**feedback_store.stats(), "used_in_model": load_metrics().get("feedback_labels_used", 0)}
+
+
+@app.get("/feedback/queue")
+def feedback_queue():
+    return feedback_store.get_queue()
+
+
+@app.delete("/feedback/queue/{queue_id}")
+def dismiss_queued(queue_id: int):
+    feedback_store.dismiss(queue_id)
+    return feedback_store.stats()
+
+
+_retrain = {"state": "idle", "started_at": None, "finished_at": None, "log": "", "error": None}
+_retrain_lock = threading.Lock()
+
+
+def _retrain_job():
+    try:
+        proc = subprocess.run(
+            [sys.executable, "train_model.py", "--include-feedback"],
+            cwd=BACKEND_DIR, capture_output=True, text=True, timeout=1800,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        _retrain["log"] = (proc.stdout + proc.stderr)[-4000:]
+        if proc.returncode != 0:
+            raise RuntimeError(f"train_model.py exited with code {proc.returncode}")
+        # Hot-reload everything the training run rewrote
+        load_model(force=True)
+        reload_calibration()
+        ensemble.reload_config()
+        _retrain["state"] = "done"
+    except Exception as exc:
+        logger.exception("Retraining failed")
+        _retrain.update(state="failed", error=str(exc))
+    finally:
+        _retrain["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@app.post("/retrain")
+def retrain():
+    with _retrain_lock:
+        if _retrain["state"] == "running":
+            raise HTTPException(status_code=409, detail="Retraining is already running")
+        _retrain.update(state="running", started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        finished_at=None, log="", error=None)
+    threading.Thread(target=_retrain_job, daemon=True).start()
+    return _retrain
+
+
+@app.get("/retrain/status")
+def retrain_status():
+    return {**_retrain, "feedback_labels_used": load_metrics().get("feedback_labels_used", 0)}

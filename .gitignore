@@ -33,6 +33,9 @@ env/
 Backend/saved_models/
 *.pkl
 
+# User feedback labels (local, may contain personal messages)
+Backend/data/feedback.db
+
 # Datasets: the training CSV is committed so a fresh clone can train the model
 *.csv
 !Backend/data/cleaned_spam.csv

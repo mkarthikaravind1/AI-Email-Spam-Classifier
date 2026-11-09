@@ -24,7 +24,8 @@ SPAM_RULES = {
     "mobile_offer": (r"\b(mobile|phone|camera)\b.{0,30}?\b(update|upgrade|latest|colour|free)\b", 1),
 }
 
-_COMPILED = {name: re.compile(pattern) for name, (pattern, _) in SPAM_RULES.items()}
+# Case-insensitive, so match positions line up with the original text (for highlighting)
+_COMPILED = {name: re.compile(pattern, re.IGNORECASE) for name, (pattern, _) in SPAM_RULES.items()}
 
 # Fallback score -> spam probability table, used only until train_model.py has
 # measured the real one from the training data and saved it to metrics.json.
@@ -33,8 +34,18 @@ _DEFAULT_CALIBRATION = [0.02, 0.5, 0.65, 0.95]
 
 # Matches the text with the rules
 def get_matched_rules(text):
-    text = str(text).lower()
+    text = str(text)
     return [name for name, pattern in _COMPILED.items() if pattern.search(text)]
+
+
+def find_spans(text):
+    """Every rule match with its position, for highlighting in the UI."""
+    return [
+        {"rule": name, "start": m.start(), "end": m.end()}
+        for name, pattern in _COMPILED.items()
+        for m in pattern.finditer(str(text))
+        if m.end() > m.start()
+    ]
 
 
 # Calculates the weighted score for a list of matched rules
@@ -62,6 +73,12 @@ def fit_calibration(scores, labels):
 
 
 _CALIBRATION = load_metrics().get("regex_calibration", _DEFAULT_CALIBRATION)
+
+
+def reload_calibration():
+    """Re-reads metrics.json after retraining."""
+    global _CALIBRATION
+    _CALIBRATION = load_metrics().get("regex_calibration", _DEFAULT_CALIBRATION)
 
 
 def spam_probability(score, calibration=None):

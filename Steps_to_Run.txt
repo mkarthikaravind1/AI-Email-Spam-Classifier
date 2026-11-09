@@ -1,7 +1,8 @@
 Backend (first time):
 cd Backend
 pip install -r requirements.txt
-python train_model.py
+python train_transformer.py        (optional, ~15-20 min on CPU: fine-tunes DistilBERT)
+python train_model.py --with-llm   (trains the rest, builds the benchmark; ~10 min)
 
 Backend (every time):
 cd Backend
